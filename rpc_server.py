@@ -191,6 +191,7 @@ def handle_rpc(body):
         "pos_getLog": rpc_get_log,
         "pos_save": rpc_save,
         "pos_validate": rpc_validate,
+        "pos_getSlotSchedule": rpc_get_slot_schedule,
     }
 
     handler = handlers.get(method)
@@ -331,7 +332,7 @@ def rpc_net_listening(params):
 
 def rpc_client_version(params):
     """web3_clientVersion - versao do cliente."""
-    return f"CofenChain/v1.0/{bc.node_id}"
+    return f"PosChain/v1.0/{bc.node_id}"
 
 
 # =============================================================
@@ -393,15 +394,16 @@ def rpc_get_validators(params):
 
 
 def rpc_produce_block(params):
-    """pos_produceBlock - produz bloco e fofoca pra rede inteira."""
+    """pos_produceBlock - produz bloco e fofoca pra rede inteira.
+    Peers vao re-validar antes de aceitar (nao confiam cegamente)."""
     block, elapsed = bc.produce_block()
     if not block:
         raise Exception(elapsed)
 
-    # GOSSIP: fofoca o bloco inteiro pra toda a rede
+    # GOSSIP: fofoca o bloco + txs (peers vao re-executar localmente)
     gossip("block", {
         "block": block.to_dict(),
-        "accounts": bc.accounts.copy(),
+        "accounts": bc.accounts.copy(),  # enviado pra sync de contas novas
         "staked": bc.staked.copy(),
         "validators": {k: v.to_dict() for k, v in bc.validators.items()},
         "burned": bc.burned,
@@ -411,8 +413,12 @@ def rpc_produce_block(params):
         "blockNumber": to_hex(block.index),
         "hash": "0x" + block.hash,
         "validator": block.validator,
+        "slot": block.slot,
+        "epoch": block.epoch,
         "transactions": len(block.transactions),
+        "attestations": len(block.attestations),
         "finalized": block.finalized,
+        "stateRoot": "0x" + block.state_root,
         "time": round(elapsed, 4),
     }
 
@@ -521,6 +527,14 @@ def rpc_validate(params):
     return {"valid": ok, "message": msg}
 
 
+def rpc_get_slot_schedule(params):
+    """pos_getSlotSchedule - escala de proposers da epoch.
+    Todos os nos calculam a mesma escala independentemente."""
+    epoch = params[0] if params else None
+    schedule = bc.get_slot_schedule(epoch)
+    return {f"slot_{k}": v for k, v in schedule.items()}
+
+
 # =============================================================
 # GOSSIP HANDLERS (recebe fofoca dos peers)
 # =============================================================
@@ -551,7 +565,10 @@ def rpc_gossip_tx(params):
 
 
 def rpc_gossip_block(params):
-    """Recebe fofoca de bloco de outro no."""
+    """Recebe fofoca de bloco de outro no.
+    AGORA: re-executa transacoes e valida state root antes de aceitar.
+    Se validacao falhar, REJEITA o bloco (como no Ethereum real).
+    Se validacao passar, envia attestation de volta pro proposer."""
     p = params[0] if params else {}
     gid = p.get("gossip_id", "")
     ttl = p.get("ttl", 0)
@@ -564,27 +581,11 @@ def rpc_gossip_block(params):
     block_data = data.get("block", {})
     block_index = block_data.get("index", 0)
 
-    # so aceita se e o proximo bloco na cadeia
     if block_index == len(bc.chain):
-        new_block = Block(
-            index=block_data["index"],
-            transactions=block_data["transactions"],
-            validator=block_data["validator"],
-            previous_hash=block_data["previous_hash"],
-            epoch=block_data["epoch"],
-        )
-        new_block.hash = block_data["hash"]
-        new_block.finalized = block_data.get("finalized", False)
-        new_block.attestations = block_data.get("attestations", [])
-        new_block.merkle_root = block_data.get("merkle_root", "")
-        new_block.timestamp = block_data.get("timestamp", "")
-
-        # sincroniza state
-        bc.accounts.update(data.get("accounts", {}))
-        bc.staked.update(data.get("staked", {}))
-        bc.burned = data.get("burned", bc.burned)
-
-        # sincroniza validadores
+        # ============================================
+        # VALIDACAO REAL: re-executa txs localmente
+        # ============================================
+        # sincroniza validadores ANTES de validar (precisa pra checar proposer)
         for addr, vdata in data.get("validators", {}).items():
             if addr not in bc.validators:
                 bc.validators[addr] = Validator(addr, vdata["stake"])
@@ -595,12 +596,66 @@ def rpc_gossip_block(params):
             v.blocks_validated = vdata["blocks_validated"]
             v.rewards = vdata["rewards"]
 
+        # garante que contas referenciadas existem no estado local
+        for tx in block_data.get("transactions", []):
+            for field in ("sender", "receiver"):
+                addr = tx.get(field, "")
+                if addr and addr not in bc.accounts and addr != "NETWORK" and not addr.startswith("0xC"):
+                    bc.accounts[addr] = data.get("accounts", {}).get(addr, 0)
+                    bc.staked[addr] = data.get("staked", {}).get(addr, 0)
+
+        valid, result = bc.validate_block(block_data)
+
+        if not valid:
+            # BLOCO REJEITADO — nao aceita, nao atesta
+            bc._log(f"BLOCO #{block_index} REJEITADO! {result}")
+            if ttl > 0:
+                gossip("block", data, ttl=ttl, gossip_id=gid)
+            return {"status": "rejected", "reason": result}
+
+        # ============================================
+        # VALIDACAO PASSOU — aceita o bloco
+        # ============================================
+        bc._log(f"BLOCO #{block_index} VALIDADO! State root confere. Aceitando...")
+
+        # aplica estado calculado localmente (NAO confia no estado do proposer)
+        bc.accounts = result["accounts"]
+        bc.burned = result["burned"]
+        bc.staked.update(data.get("staked", {}))
+
+        new_block = Block(
+            index=block_data["index"],
+            transactions=block_data["transactions"],
+            validator=block_data["validator"],
+            previous_hash=block_data["previous_hash"],
+            epoch=block_data["epoch"],
+            slot=block_data.get("slot", 0),
+        )
+        new_block.hash = block_data["hash"]
+        new_block.attestations = block_data.get("attestations", [])
+        new_block.merkle_root = block_data.get("merkle_root", "")
+        new_block.state_root = block_data.get("state_root", "")
+        new_block.timestamp = block_data.get("timestamp", "")
+
+        # ATTESTATION REAL: este no validou, entao atesta
+        my_validators = [a for a in bc.validators
+                         if bc.validators[a].is_active and not bc.validators[a].slashed]
+        for v_addr in my_validators:
+            if v_addr not in new_block.attestations:
+                new_block.attestations.append(v_addr)
+                bc._log(f"ATTESTATION: {v_addr[:12]}... atestou bloco #{block_index} (validacao real)")
+
+        # checa finalidade
+        bc.check_finality(new_block)
+
         bc.chain.append(new_block)
         bc.current_epoch = block_data.get("epoch", bc.current_epoch)
-        # limpa mempool (transacoes ja foram incluidas no bloco)
         bc.mempool.transactions.clear()
 
-        bc._log(f"GOSSIP RECV [block] #{block_index} from {p.get('origin','?')}")
+        bc._log(f"GOSSIP RECV [block] #{block_index} from {p.get('origin','?')} "
+                f"att={len(new_block.attestations)} "
+                f"{'[FINAL]' if new_block.finalized else '[pending]'}")
+
     elif block_index <= len(bc.chain) - 1:
         bc._log(f"GOSSIP RECV [block] #{block_index} ja tenho, ignorando")
     else:
@@ -707,7 +762,7 @@ def rpc_gossip_slash(params):
 @app.route("/", methods=["GET"])
 def info():
     return jsonify({
-        "name": f"CofenChain JSON-RPC [{bc.node_id}]",
+        "name": f"PosChain JSON-RPC [{bc.node_id}]",
         "jsonrpc": "2.0",
         "port": "8545 (padrao Ethereum)",
         "blocks": len(bc.chain),
@@ -749,7 +804,7 @@ if __name__ == "__main__":
     peers.extend(args.peer)
 
     print(f"\n{'='*50}")
-    print(f"  CofenChain JSON-RPC 2.0")
+    print(f"  PosChain JSON-RPC 2.0")
     print(f"  Node: {args.node}")
     print(f"  URL:  http://localhost:{args.port}")
     print(f"  Peers: {peers or 'nenhum'}")

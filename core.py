@@ -63,13 +63,14 @@ class Transaction:
 # BLOCO
 # =============================================================
 class Block:
-    def __init__(self, index, transactions, validator, previous_hash, epoch):
+    def __init__(self, index, transactions, validator, previous_hash, epoch, slot=0):
         self.index = index
         self.timestamp = str(datetime.now())
         self.transactions = transactions  # lista de dicts
         self.validator = validator
         self.previous_hash = previous_hash
         self.epoch = epoch
+        self.slot = slot  # posicao dentro da epoch
         self.merkle_root = self._merkle_root()
         self.state_root = ""
         self.hash = self.calc_hash()
@@ -102,6 +103,7 @@ class Block:
             "index": self.index, "timestamp": self.timestamp,
             "transactions": self.transactions, "validator": self.validator,
             "previous_hash": self.previous_hash, "epoch": self.epoch,
+            "slot": self.slot, "state_root": self.state_root,
             "merkle_root": self.merkle_root, "hash": self.hash,
             "finalized": self.finalized, "attestations": self.attestations,
         }
@@ -310,30 +312,66 @@ class Blockchain:
         return True, f"Tx {tx.tx_id} adicionada a mempool (pos: {self.mempool.size()})"
 
     # ---------------------------------------------------------
-    # SELECAO DE VALIDADOR
+    # SELECAO DE VALIDADOR (SLOTS DETERMINISTICOS)
     # ---------------------------------------------------------
-    def _select_validator(self):
-        active = {k: v for k, v in self.validators.items()
-                  if v.is_active and not v.slashed}
+    def _get_epoch_seed(self, epoch):
+        """Gera seed deterministica pra epoch baseada no hash do ultimo bloco da epoch anterior.
+        Todos os nos calculam a mesma seed → mesma escala de slots.
+        Similar ao RANDAO do Ethereum (simplificado)."""
+        if epoch == 0:
+            return hashlib.sha256(b"genesis_seed").hexdigest()
+        # pega o hash do ultimo bloco da epoch anterior
+        boundary_index = epoch * self.BLOCKS_PER_EPOCH
+        if boundary_index > 0 and boundary_index <= len(self.chain):
+            return self.chain[boundary_index - 1].hash
+        return hashlib.sha256(f"epoch_{epoch}".encode()).hexdigest()
+
+    def get_slot_schedule(self, epoch=None):
+        """Retorna a escala de proposers pra uma epoch inteira.
+        Cada no calcula independentemente e chega no mesmo resultado."""
+        if epoch is None:
+            epoch = len(self.chain) // self.BLOCKS_PER_EPOCH
+        active = sorted([k for k, v in self.validators.items()
+                         if v.is_active and not v.slashed])
         if not active:
+            return {}
+        seed = self._get_epoch_seed(epoch)
+        schedule = {}
+        for slot in range(self.BLOCKS_PER_EPOCH):
+            # hash deterministico: seed + slot → indice do validador
+            slot_hash = hashlib.sha256(f"{seed}:{slot}".encode()).hexdigest()
+            # peso por stake: validadores com mais stake tem mais chance
+            weights = [self.validators[a].stake for a in active]
+            total = sum(weights)
+            # usa o hash pra gerar um numero entre 0 e total
+            pick = int(slot_hash, 16) % int(total * 100) / 100
+            cumulative = 0
+            chosen = active[0]
+            for i, addr in enumerate(active):
+                cumulative += weights[i]
+                if pick < cumulative:
+                    chosen = addr
+                    break
+            schedule[slot] = chosen
+        return schedule
+
+    def _select_validator(self):
+        """Seleciona o proposer do slot atual baseado na escala da epoch."""
+        schedule = self.get_slot_schedule()
+        if not schedule:
             return None
-        total = sum(v.stake for v in active.values())
-        weights = [v.stake / total for v in active.values()]
-        return random.choices(list(active.keys()), weights=weights, k=1)[0]
+        slot_in_epoch = (len(self.chain)) % self.BLOCKS_PER_EPOCH
+        return schedule.get(slot_in_epoch)
 
     # ---------------------------------------------------------
-    # VALIDACAO DE BLOCO
+    # EXECUCAO DE TRANSACOES (usado pelo proposer e pela validacao)
     # ---------------------------------------------------------
-    def produce_block(self):
-        validator_addr = self._select_validator()
-        if not validator_addr:
-            return None, "Sem validadores ativos"
-
-        start = time.time()
-        validator = self.validators[validator_addr]
-
-        # pega transacoes da mempool (priorizadas por tip)
-        batch = self.mempool.get_batch(self.MAX_TXN_PER_BLOCK)
+    def _execute_transactions(self, batch, accounts_snapshot, burned):
+        """Re-executa transacoes sobre um snapshot de contas.
+        Retorna (block_txns, total_tips, accounts_final, burned_final).
+        Tanto o proposer quanto os validadores usam este metodo,
+        garantindo que todos chegam no mesmo resultado."""
+        accounts = dict(accounts_snapshot)  # copia pra nao alterar original
         block_txns = []
         total_tips = 0
 
@@ -347,28 +385,52 @@ class Blockchain:
                 tip = tx_dict.get("tip", 0)
                 total_cost = amount + self.BASE_FEE + tip
 
-                if sender in self.accounts and self.accounts[sender] >= total_cost:
-                    self.accounts[sender] -= total_cost
-                    if receiver not in self.accounts:
-                        self.accounts[receiver] = 0
-                    self.accounts[receiver] += amount
-                    self.burned += self.BASE_FEE
+                if sender in accounts and accounts[sender] >= total_cost:
+                    accounts[sender] -= total_cost
+                    if receiver not in accounts:
+                        accounts[receiver] = 0
+                    accounts[receiver] += amount
+                    burned += self.BASE_FEE
                     total_tips += tip
                     tx_dict["status"] = "confirmed"
                 else:
                     tx_dict["status"] = "failed"
 
-            elif tx_type in ("stake", "unstake"):
-                tx_dict["status"] = "confirmed"
-
-            elif tx_type == "contract_deploy":
-                tx_dict["status"] = "confirmed"
-
-            elif tx_type == "contract_call":
+            elif tx_type in ("stake", "unstake", "contract_deploy", "contract_call"):
                 tx_dict["status"] = "confirmed"
 
             block_txns.append(tx_dict)
-            self.tx_history.append(tx_dict)
+
+        return block_txns, total_tips, accounts, burned
+
+    # ---------------------------------------------------------
+    # PRODUCAO DE BLOCO (PROPOSER)
+    # ---------------------------------------------------------
+    def produce_block(self):
+        validator_addr = self._select_validator()
+        if not validator_addr:
+            return None, "Sem validadores ativos"
+
+        start = time.time()
+        validator = self.validators[validator_addr]
+        slot_in_epoch = (len(self.chain)) % self.BLOCKS_PER_EPOCH
+        epoch = len(self.chain) // self.BLOCKS_PER_EPOCH
+
+        self._log(f"SLOT {slot_in_epoch}/epoch {epoch}: proposer designado = {validator_addr[:12]}...")
+
+        # pega transacoes da mempool (priorizadas por tip)
+        batch = self.mempool.get_batch(self.MAX_TXN_PER_BLOCK)
+
+        # executa transacoes (mesma logica que os validadores vao usar)
+        block_txns, total_tips, new_accounts, new_burned = self._execute_transactions(
+            batch, self.accounts, self.burned
+        )
+
+        # aplica estado
+        self.accounts = new_accounts
+        self.burned = new_burned
+        for tx in block_txns:
+            self.tx_history.append(tx)
 
         # recompensa
         reward = self.BASE_REWARD + total_tips
@@ -390,32 +452,24 @@ class Blockchain:
         validator.rewards += reward
         validator.blocks_validated += 1
 
-        epoch = len(self.chain) // self.BLOCKS_PER_EPOCH
-
         new_block = Block(
             index=len(self.chain),
             transactions=block_txns,
             validator=validator_addr,
             previous_hash=self.last_block.hash,
             epoch=epoch,
+            slot=slot_in_epoch,
         )
 
-        # attestations
-        active = [v for v in self.validators.values() if v.is_active and not v.slashed]
-        for v in active:
-            if random.random() < 0.9:
-                new_block.attestations.append(v.address)
-
-        if len(active) > 0 and len(new_block.attestations) / len(active) >= self.FINALITY_THRESHOLD:
-            new_block.finalized = True
-            for tx in block_txns:
-                tx["status"] = "finalized"
-
-        # recalcula hash apos processar tudo (state mudou)
+        # state root = hash do estado das contas apos executar tudo
         new_block.state_root = hashlib.sha256(
             json.dumps(self.accounts, sort_keys=True).encode()
         ).hexdigest()
         new_block.hash = new_block.calc_hash()
+
+        # NAO adiciona attestations aqui — os peers vao validar e atestar via gossip
+        # o proposer atesta o proprio bloco
+        new_block.attestations.append(validator_addr)
 
         self.chain.append(new_block)
         elapsed = time.time() - start
@@ -424,11 +478,75 @@ class Blockchain:
             self.current_epoch = epoch
             self._log(f"=== NOVA EPOCH: {epoch} ===")
 
-        self._log(f"BLOCO #{new_block.index} validado por {validator_addr[:12]}... "
-                  f"({len(block_txns)} txns, {elapsed:.4f}s) "
-                  f"{'[FINAL]' if new_block.finalized else '[pending]'}")
+        self._log(f"BLOCO #{new_block.index} PROPOSTO por {validator_addr[:12]}... "
+                  f"(slot {slot_in_epoch}, {len(block_txns)} txns, {elapsed:.4f}s) "
+                  f"state_root={new_block.state_root[:16]}...")
 
         return new_block, elapsed
+
+    # ---------------------------------------------------------
+    # VALIDACAO DE BLOCO RECEBIDO (re-execucao independente)
+    # ---------------------------------------------------------
+    def validate_block(self, block_data):
+        """Valida um bloco recebido de outro no, re-executando as transacoes.
+        Cada no faz isso independentemente — ninguem confia em ninguem.
+
+        Verifica:
+          1. Hash do bloco anterior bate com nosso ultimo bloco
+          2. O proposer e o designado pra esse slot (escala deterministica)
+          3. Re-executa TODAS as transacoes sobre nosso estado local
+          4. Calcula state root e compara com o declarado pelo proposer
+          5. Se tudo bater → ACEITA. Senao → REJEITA.
+        """
+        block_index = block_data.get("index", 0)
+        declared_state_root = block_data.get("state_root", "")
+        declared_validator = block_data.get("validator", "")
+        declared_prev_hash = block_data.get("previous_hash", "")
+        epoch = block_data.get("epoch", 0)
+        slot = block_data.get("slot", 0)
+
+        # 1. Verifica encadeamento: hash anterior bate?
+        if declared_prev_hash != self.last_block.hash:
+            return False, f"Hash anterior nao bate. Esperado={self.last_block.hash[:16]}... Recebido={declared_prev_hash[:16]}..."
+
+        # 2. Verifica proposer: e o validador designado pra esse slot?
+        schedule = self.get_slot_schedule(epoch)
+        expected_proposer = schedule.get(slot)
+        if expected_proposer and declared_validator != expected_proposer:
+            return False, f"Proposer invalido! Slot {slot} designado={expected_proposer[:12]}... recebido={declared_validator[:12]}..."
+
+        # 3. Re-executa transacoes (IGNORA reward tx — recalcula)
+        txns_without_reward = [tx for tx in block_data.get("transactions", [])
+                               if tx.get("tx_type") != "reward"]
+
+        _, total_tips, simulated_accounts, simulated_burned = self._execute_transactions(
+            txns_without_reward, self.accounts, self.burned
+        )
+
+        # aplica recompensa no estado simulado
+        reward = self.BASE_REWARD + total_tips
+        if declared_validator not in simulated_accounts:
+            simulated_accounts[declared_validator] = 0
+        simulated_accounts[declared_validator] += reward
+
+        # 4. Calcula state root e compara
+        computed_state_root = hashlib.sha256(
+            json.dumps(simulated_accounts, sort_keys=True).encode()
+        ).hexdigest()
+
+        if declared_state_root and computed_state_root != declared_state_root:
+            return False, (f"State root NAO BATE! "
+                           f"Calculado={computed_state_root[:16]}... "
+                           f"Declarado={declared_state_root[:16]}... "
+                           f"BLOCO REJEITADO (proposer pode estar trapaceando)")
+
+        # 5. Tudo bateu → retorna estado simulado pra aplicar
+        return True, {
+            "accounts": simulated_accounts,
+            "burned": simulated_burned,
+            "reward": reward,
+            "state_root": computed_state_root,
+        }
 
     # ---------------------------------------------------------
     # SLASHING
@@ -547,6 +665,20 @@ class Blockchain:
     # ---------------------------------------------------------
     # PRINT
     # ---------------------------------------------------------
+    def check_finality(self, block):
+        """Verifica se o bloco atingiu finalidade (>= 66% dos validadores atestaram)."""
+        active = [v for v in self.validators.values() if v.is_active and not v.slashed]
+        if len(active) == 0:
+            return False
+        ratio = len(block.attestations) / len(active)
+        if ratio >= self.FINALITY_THRESHOLD:
+            block.finalized = True
+            for tx in block.transactions:
+                tx["status"] = "finalized"
+            self._log(f"BLOCO #{block.index} FINALIZADO! ({len(block.attestations)}/{len(active)} attestations = {ratio:.0%})")
+            return True
+        return False
+
     def print_chain(self):
         print("\n" + "=" * 70)
         print(f"  BLOCKCHAIN [{self.node_id}] - {len(self.chain)} blocos")
@@ -554,7 +686,7 @@ class Blockchain:
         for b in self.chain:
             status = "[FINAL]" if b.finalized else "[pend.]"
             att = len(b.attestations)
-            print(f"\n  +-- Bloco #{b.index} {status} (attestations: {att})")
+            print(f"\n  +-- Bloco #{b.index} {status} (slot {b.slot}, attestations: {att})")
             print(f"  |  Validator:  {b.validator}")
             print(f"  |  Epoch:      {b.epoch}")
             print(f"  |  Hash:       {b.hash}")

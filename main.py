@@ -150,22 +150,22 @@ def main():
 
     # --- NFT ---
     print("\n  --- NFT ---")
-    ok, msg = bc.deploy_contract(wallets["Alice"].address, "CofenNFT", nft_contract)
+    ok, msg = bc.deploy_contract(wallets["Alice"].address, "PosNFT", nft_contract)
     print(f"  Deploy: {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenNFT",
-                               {"action": "mint", "metadata": {"name": "CofenArt #1", "rarity": "legendary"}})
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosNFT",
+                               {"action": "mint", "metadata": {"name": "PosArt #1", "rarity": "legendary"}})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Bob"].address, "CofenNFT",
-                               {"action": "mint", "metadata": {"name": "CofenArt #2", "rarity": "common"}})
+    ok, msg = bc.call_contract(wallets["Bob"].address, "PosNFT",
+                               {"action": "mint", "metadata": {"name": "PosArt #2", "rarity": "common"}})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenNFT",
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosNFT",
                                {"action": "transfer", "token_id": 1, "to": wallets["Carol"].address})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Carol"].address, "CofenNFT", {"action": "list"})
+    ok, msg = bc.call_contract(wallets["Carol"].address, "PosNFT", {"action": "list"})
     print(f"  {msg}")
 
     # --- Crowdfunding ---
@@ -181,21 +181,21 @@ def main():
 
     # --- DEX ---
     print("\n  --- DEX (Exchange Descentralizada) ---")
-    ok, msg = bc.deploy_contract(wallets["Alice"].address, "CofenDEX", dex_swap)
+    ok, msg = bc.deploy_contract(wallets["Alice"].address, "PosDEX", dex_swap)
     print(f"  Deploy: {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenDEX", {"action": "pool_info"})
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosDEX", {"action": "pool_info"})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Bob"].address, "CofenDEX",
+    ok, msg = bc.call_contract(wallets["Bob"].address, "PosDEX",
                                {"action": "swap_a_to_b", "amount": 50})
     print(f"  Bob: {msg}")
 
-    ok, msg = bc.call_contract(wallets["Carol"].address, "CofenDEX",
+    ok, msg = bc.call_contract(wallets["Carol"].address, "PosDEX",
                                {"action": "swap_b_to_a", "amount": 30})
     print(f"  Carol: {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenDEX", {"action": "pool_info"})
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosDEX", {"action": "pool_info"})
     print(f"  {msg}")
 
     # --- Votacao ---

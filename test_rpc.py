@@ -110,8 +110,8 @@ def main():
                                "params": {"action": "balance_of"}}])
 
     # NFT
-    rpc("pos_deployContract", [{"creator": alice, "id": "CofenNFT", "type": "nft"}])
-    rpc("pos_callContract", [{"caller": alice, "id": "CofenNFT",
+    rpc("pos_deployContract", [{"creator": alice, "id": "PosNFT", "type": "nft"}])
+    rpc("pos_callContract", [{"caller": alice, "id": "PosNFT",
                                "params": {"action": "mint", "metadata": {"name": "Art #1"}}}])
 
     # Votacao
