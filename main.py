@@ -127,25 +127,25 @@ def main():
 
     # --- Token ERC-20 ---
     print("\n  --- TOKEN ERC-20 ---")
-    ok, msg = bc.deploy_contract(wallets["Alice"].address, "CofenToken", token_erc20)
+    ok, msg = bc.deploy_contract(wallets["Alice"].address, "PosToken", token_erc20)
     print(f"  Deploy: {msg}")
 
-    bc.contracts["CofenToken"].state["name"] = "CofenToken"
-    bc.contracts["CofenToken"].state["symbol"] = "CFN"
+    bc.contracts["PosToken"].state["name"] = "PosToken"
+    bc.contracts["PosToken"].state["symbol"] = "CFN"
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenToken",
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosToken",
                                {"action": "mint", "amount": 10000, "to": wallets["Alice"].address})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenToken",
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosToken",
                                {"action": "transfer", "to": wallets["Bob"].address, "amount": 500})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Bob"].address, "CofenToken",
+    ok, msg = bc.call_contract(wallets["Bob"].address, "PosToken",
                                {"action": "balance_of"})
     print(f"  {msg}")
 
-    ok, msg = bc.call_contract(wallets["Alice"].address, "CofenToken", {"action": "info"})
+    ok, msg = bc.call_contract(wallets["Alice"].address, "PosToken", {"action": "info"})
     print(f"  {msg}")
 
     # --- NFT ---

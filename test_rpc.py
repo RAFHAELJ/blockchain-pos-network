@@ -100,13 +100,13 @@ def main():
     # --- Smart Contracts ---
     sep("8. SMART CONTRACTS")
 
-    rpc("pos_deployContract", [{"creator": alice, "id": "CofenToken", "type": "token",
-                                 "state": {"name": "CofenToken", "symbol": "CFN"}}])
-    rpc("pos_callContract", [{"caller": alice, "id": "CofenToken",
+    rpc("pos_deployContract", [{"creator": alice, "id": "PosToken", "type": "token",
+                                 "state": {"name": "PosToken", "symbol": "CFN"}}])
+    rpc("pos_callContract", [{"caller": alice, "id": "PosToken",
                                "params": {"action": "mint", "amount": 10000, "to": alice}}])
-    rpc("pos_callContract", [{"caller": alice, "id": "CofenToken",
+    rpc("pos_callContract", [{"caller": alice, "id": "PosToken",
                                "params": {"action": "transfer", "to": bob, "amount": 500}}])
-    rpc("pos_callContract", [{"caller": bob, "id": "CofenToken",
+    rpc("pos_callContract", [{"caller": bob, "id": "PosToken",
                                "params": {"action": "balance_of"}}])
 
     # NFT
